@@ -1,128 +1,149 @@
 #!/usr/bin/env python3
 """
-list_objects.py
+query_objects.py
+----------------
+Unicast‑queries a BACnet/IP device for its object list.
 
-Discover a single BACnet device at a known IP:port (no broadcast),
-read its objectList, print to console, and exit.
+usage:
+    python query_objects.py 195.168.0.53               # default BACnet port 47808
+    python query_objects.py 195.168.0.53 47810         # non‑standard remote port
+
+If you already know the device‑instance ID you may pass it with -d/--device.
 """
 
 import sys
 import argparse
-
-from bacpypes.core import run, stop
+import types
+from bacpypes.core import run, stop, enable_sleeping
+from bacpypes.pdu import Address
 from bacpypes.app import BIPSimpleApplication
 from bacpypes.local.device import LocalDeviceObject
-from bacpypes.pdu import Address
+from bacpypes.basetypes import ServicesSupported
 from bacpypes.apdu import (
     WhoIsRequest,
     IAmRequest,
     ReadPropertyRequest,
     ReadPropertyACK,
+    Error,
+    AbortPDU,
+    RejectPDU,
 )
+from bacpypes.primitivedata import ObjectIdentifier
+from bacpypes.constructeddata import ArrayOf
 
+# --------------------------------------------------------------------------- #
+# helper: build a skeleton LocalDeviceObject (values do not matter for a client)
+def make_local_device(device_id: int = 599):
+    services_supported = ServicesSupported()
+    services_supported['whoIs'] = True
+    services_supported['readProperty'] = True
 
-class BACnetClient(BIPSimpleApplication):
-    def __init__(self, device, local_address):
-        super().__init__(device, local_address)
-        self._remote_instance = None
-        self._object_list = None
-
-    def confirmation(self, apdu):
-        # Handle IAm (instance discovery)
-        if isinstance(apdu, IAmRequest):
-            # apdu.iAmDeviceIdentifier is a tuple ( 'device', instance )
-            self._remote_instance = apdu.iAmDeviceIdentifier[1]
-            # once we have the instance, stop the current run loop
-            stop()
-
-        # Handle ReadProperty ACK
-        elif isinstance(apdu, ReadPropertyACK):
-            # propertyValue.cast_out() returns a list of objectIdentifier tuples
-            self._object_list = apdu.propertyValue.cast_out()
-            stop()
-
-    @property
-    def remote_instance(self):
-        return self._remote_instance
-
-    @property
-    def object_list(self):
-        return self._object_list
-
-
-def main():
-    p = argparse.ArgumentParser(
-        description="Read objectList from a BACnet device via unicast."
-    )
-    p.add_argument(
-        "--local-ip", required=True,
-        help="Local IPv4 address to bind (must be on 192.168.0.x)"
-    )
-    p.add_argument(
-        "--local-port", type=int, default=47809,
-        help="Local UDP port (must not be 47808)"
-    )
-    p.add_argument(
-        "--remote-ip", default="192.168.0.53",
-        help="BACnet device IP (default: 192.168.0.53)"
-    )
-    p.add_argument(
-        "--remote-port", type=int, default=47808,
-        help="BACnet device port (default: 47808)"
-    )
-    p.add_argument(
-        "--remote-instance", type=int,
-        help="If known, the device instance number; skips WhoIs"
-    )
-    args = p.parse_args()
-
-    # 1) build our local device object
-    device = LocalDeviceObject(
-        objectName="bacpypes-client",
-        objectIdentifier=599,             # your client’s device instance #
+    return LocalDeviceObject(
+        objectName="BacpypesClient",
+        objectIdentifier=('device', device_id),
         maxApduLengthAccepted=1024,
-        segmentationSupported="segmentedBoth",
-        vendorIdentifier=15,
+        segmentationSupported='noSegmentation',
+        vendorIdentifier=999,           # arbitrary, must be < 65535
+        protocolServicesSupported=services_supported,
     )
 
-    # 2) start the BACnet/IP application on local_ip:local_port
-    local_addr = f"{args.local_ip}:{args.local_port}"
-    app = BACnetClient(device, local_addr)
+# --------------------------------------------------------------------------- #
+class ClientApplication(BIPSimpleApplication):
+    """
+    Derived application that handles:
+      * I-Am → grab device instance, then send ReadProperty(objectList)
+      * ReadPropertyACK → print & exit
+    """
 
-    # 3) discover remote instance if needed
-    instance = args.remote_instance
-    if instance is None:
-        print(f"→ Sending directed WhoIs to {args.remote_ip}:{args.remote_port} …")
-        whois = WhoIsRequest()
-        whois.pduDestination = Address(f"{args.remote_ip}:{args.remote_port}")
-        app.request(whois)
-        run()
-        instance = app.remote_instance
-        if instance is None:
-            print("✖ IAm not received; exiting.")
-            sys.exit(1)
-        print(f"← Discovered device instance: {instance}")
+    def __init__(self, *args, target_addr: Address, target_port: int, device_instance: int | None):
+        super().__init__(*args)
+        self.target = Address(f"{target_addr}:{target_port}")
+        self.known_device_instance = device_instance
+        enable_sleeping()       # allow other threads to run
 
-    # 4) request objectList from that device instance
-    print(f"→ Reading objectList from instance {instance} …")
-    rp = ReadPropertyRequest(
-        objectIdentifier=('device', instance),
-        propertyIdentifier='objectList'
+    # -- started by bacpypes core ------------------------------------------------
+    def request_device_information(self):
+        """Kick‑off after the core is running."""
+        if self.known_device_instance is not None:
+            self.read_object_list(self.known_device_instance)
+        else:
+            # Send unicast Who‑Is (device range 0‑4194303)
+            who_is = WhoIsRequest()
+            who_is.pduDestination = self.target
+            print(f">>> Who‑Is → {self.target}")
+            self.request(who_is)
+
+    def indication(self, apdu):
+        """We override to call request_device_information once the stack is ready."""
+        # The first time indication() is called the network layer is up.
+        self.indication = super().indication  # restore original
+        self.request_device_information()
+        super().indication(apdu)
+
+    # -- incoming APDUs ----------------------------------------------------------
+    def confirmation(self, apdu):
+        if isinstance(apdu, IAmRequest):
+            dev_instance = apdu.iAmDeviceIdentifier[1]
+            print(f"<<< I‑Am from {apdu.pduSource} (device‑instance={dev_instance})")
+            self.read_object_list(dev_instance)
+
+        elif isinstance(apdu, ReadPropertyACK):
+            value = apdu.propertyValue
+            # objectList is an ArrayOf(ObjectIdentifier)
+            if isinstance(value, ArrayOf):
+                objects = [f"{obj[0]}:{obj[1]}" for obj in value.value]
+                print("\n--- Object List ---")
+                for idx, obj in enumerate(objects, 1):
+                    print(f"{idx:3d}. {obj}")
+                print("-------------------")
+            else:
+                print("Received unexpected datatype:", value)
+
+            stop()  # all done
+
+        elif isinstance(apdu, (Error, AbortPDU, RejectPDU)):
+            print("BACnet error:", apdu)
+            stop()
+
+        else:
+            # forward anything we don't care about
+            super().confirmation(apdu)
+
+    # -- helpers -----------------------------------------------------------------
+    def read_object_list(self, device_instance: int):
+        """Send ReadProperty(Device, objectList) to already‑known instance."""
+        req = ReadPropertyRequest(
+            objectIdentifier=('device', device_instance),
+            propertyIdentifier='objectList',
+        )
+        req.pduDestination = self.target
+        print(f">>> ReadProperty(objectList) → {self.target} (device {device_instance})")
+        self.request(req)
+
+# --------------------------------------------------------------------------- #
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("ip", help="target BACnet/IP address")
+    parser.add_argument("port", nargs='?', default=47808, type=int, help="target UDP port (default 47808)")
+    parser.add_argument("-d", "--device", type=int, help="device‑instance ID (skip Who‑Is)")
+    parser.add_argument("-l", "--local-port", type=int, default=47809,
+                        help="local UDP port to bind (FREE; default 47809)")
+    args = parser.parse_args()
+
+    # Build local device and application
+    this_device = make_local_device()
+    app = ClientApplication(
+        this_device,
+        f"0.0.0.0:{args.local_port}",        # let OS choose IF; avoid busy 47808
+        target_addr=args.ip,
+        target_port=args.port,
+        device_instance=args.device,
     )
-    rp.pduDestination = Address(f"{args.remote_ip}:{args.remote_port}")
-    app.request(rp)
-    run()
 
-    # 5) print the result
-    objs = app.object_list
-    if objs is None:
-        print("✖ No ReadPropertyACK received; exiting.")
-        sys.exit(1)
+    try:
+        run()   # blocks until stop() is called
+    except KeyboardInterrupt:
+        pass
 
-    print("← objectList:")
-    for obj in objs:
-        # each obj is a tuple like ('analogInput', 1)
-        print(f" - {obj[0]} #{obj[1]}")
-
-if __name__ == "__main__":
+if __name__ == "__main__":          # pragma: no cover
     main()
