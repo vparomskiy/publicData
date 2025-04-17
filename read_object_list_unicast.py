@@ -32,20 +32,26 @@ from bacpypes.primitivedata import ObjectIdentifier
 from bacpypes.constructeddata import ArrayOf
 
 # --------------------------------------------------------------------------- #
-# helper: build a skeleton LocalDeviceObject (values do not matter for a client)
 def make_local_device(device_id: int = 599):
-    services_supported = ServicesSupported()
-    services_supported['whoIs'] = True
-    services_supported['readProperty'] = True
-
-    return LocalDeviceObject(
+    """
+    Create a minimal local Device object *without* trying to override
+    protocolServicesSupported in the constructor – we tweak it afterwards.
+    """
+    ldev = LocalDeviceObject(
         objectName="BacpypesClient",
-        objectIdentifier=('device', device_id),
+        objectIdentifier=("device", device_id),
         maxApduLengthAccepted=1024,
-        segmentationSupported='noSegmentation',
-        vendorIdentifier=999,           # arbitrary, must be < 65535
-        protocolServicesSupported=services_supported,
+        segmentationSupported="noSegmentation",
+        vendorIdentifier=999,
     )
+
+    # turn on only the client services we need
+    pss = ldev.protocolServicesSupported
+    pss["whoIs"] = True
+    pss["readProperty"] = True
+
+    return ldev
+
 
 # --------------------------------------------------------------------------- #
 class ClientApplication(BIPSimpleApplication):
